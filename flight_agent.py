@@ -26,6 +26,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 import config
+from logic.flight_extractor import extract_flight_results
+from logic.price_comparator import find_cheapest_flight
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -636,6 +638,9 @@ def _set_passengers(driver, num_passengers: int) -> None:
 def automate_search(info: FlightInfo) -> webdriver.Chrome:
     """Open Google Flights, fill the search form, and click Search."""
     driver = launch_browser()
+    flights = []
+    sorted_flights = []
+    cheapest_flight = None
 
     print("\n🌐 Opening Google Flights …")
     driver.get(config.GOOGLE_FLIGHTS_URL)
@@ -679,10 +684,45 @@ def automate_search(info: FlightInfo) -> webdriver.Chrome:
         clicked = _click_search_and_wait(driver, timeout=20)
         if clicked:
             print("   ✓ Search clicked and submission triggered.")
+
+            # ── Extract results from Google Flights search page ─────────────
+            print("\n📊 Extracting flight results …")
+            try:
+                flights = extract_flight_results(driver, max_results=15, timeout=30)
+                print(f"\nExtracted {len(flights)} flights")
+
+                print("\nSorting flights by price...")
+                sorted_flights, cheapest_flight = find_cheapest_flight(flights)
+
+                print("\nCheapest flight found:")
+                if cheapest_flight:
+                    print(f"Airline: {cheapest_flight.get('airline', '')}")
+                    print(f"Departure: {cheapest_flight.get('departure', '')}")
+                    print(f"Arrival: {cheapest_flight.get('arrival', '')}")
+                    print(f"Duration: {cheapest_flight.get('duration', '')}")
+                    print(f"Stops: {cheapest_flight.get('stops', '')}")
+                    print(f"Price: {cheapest_flight.get('price', '')}")
+                else:
+                    print("No valid priced flights were found.")
+
+                for i, f in enumerate(sorted_flights[:5], start=1):
+                    print(
+                        f"      {i}. {f.get('airline', '')} | "
+                        f"{f.get('departure', '')} → {f.get('arrival', '')} | "
+                        f"{f.get('duration', '')} | {f.get('stops', '')} | {f.get('price', '')}"
+                    )
+            except Exception as exc:
+                err_text = str(exc).strip() or repr(exc)
+                print(f"   ⚠ Could not extract flight results ({type(exc).__name__}): {err_text}")
         else:
             print("   ⚠ Could not find Search button. Click it manually.")
     except Exception:
         print("   ⚠ Could not click Search. Click it manually.")
+
+    # Store extracted list on driver object for optional downstream usage.
+    driver.extracted_flights = flights
+    driver.sorted_flights = sorted_flights
+    driver.cheapest_flight = cheapest_flight
 
     print("\n✅ Done! The browser will stay open for you.\n")
     return driver
