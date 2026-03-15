@@ -26,8 +26,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 import config
-from logic.flight_extractor import extract_flight_results
-from logic.price_comparator import find_cheapest_flight
+from logic.flight_extractor import extract_flight_results, wait_for_results_container
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -604,6 +603,463 @@ def _click_search_and_wait(driver, timeout: int = 20) -> bool:
     return True
 
 
+def _get_visible_flight_cards(driver):
+    """Return visible flight-result cards using structural XPath locators."""
+    card_xpaths = [
+        "//ul[@role='listbox']/li",
+        "//*[@role='listitem']",
+        "//div[contains(normalize-space(.), '₹') and (contains(normalize-space(.), 'AM') or contains(normalize-space(.), 'PM'))]",
+    ]
+
+    cards = []
+    seen = set()
+    for xp in card_xpaths:
+        try:
+            for el in driver.find_elements(By.XPATH, xp):
+                if not el.is_displayed():
+                    continue
+                if el.id in seen:
+                    continue
+                seen.add(el.id)
+                cards.append(el)
+        except Exception:
+            continue
+    return cards
+
+
+def _retry_click_card(driver, element, retries: int = 3, delay: float = 0.5) -> bool:
+    """Retry click for dynamic result cards."""
+    for _ in range(retries):
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'instant', block:'center', inline:'nearest'});",
+                element,
+            )
+            safe_click(driver, element)
+            return True
+        except Exception:
+            time.sleep(delay)
+    return False
+
+
+def _select_cheapest_from_sorted_list(driver, timeout: int = 30) -> bool:
+    """
+    Use Google Flights built-in "Cheapest" tab and pick first visible card.
+    """
+    wait_for_results_container(driver, timeout=timeout)
+    wait = WebDriverWait(driver, timeout)
+
+    before_cards = _get_visible_flight_cards(driver)
+    before_first_text = before_cards[0].text.strip() if before_cards else ""
+
+    cheapest_locators = [
+        (By.XPATH, "//button[contains(normalize-space(.), 'Cheapest') or .//span[contains(normalize-space(.), 'Cheapest')]]"),
+        (By.XPATH, "//*[@role='tab' and contains(normalize-space(.), 'Cheapest')]"),
+    ]
+
+    cheapest_tab = None
+    for by, value in cheapest_locators:
+        try:
+            elems = driver.find_elements(by, value)
+            visible = [e for e in elems if e.is_displayed() and e.get_attribute("aria-disabled") != "true"]
+            if visible:
+                cheapest_tab = visible[0]
+                break
+        except Exception:
+            continue
+
+    if cheapest_tab is None:
+        return False
+
+    print("Clicking Cheapest filter to sort flights by lowest price.")
+    if not _retry_click_card(driver, cheapest_tab, retries=3, delay=0.6):
+        return False
+
+    # Wait for reorder: either tab becomes selected or first card text changes.
+    try:
+        wait.until(
+            lambda d: (
+                (cheapest_tab.get_attribute("aria-selected") or "").lower() == "true"
+                or (cheapest_tab.get_attribute("aria-pressed") or "").lower() == "true"
+                or (
+                    len(_get_visible_flight_cards(d)) > 0
+                    and _get_visible_flight_cards(d)[0].text.strip() != before_first_text
+                )
+            )
+        )
+    except Exception:
+        # Continue best-effort even if explicit reorder signal is unavailable.
+        pass
+
+    wait.until(lambda d: len(_get_visible_flight_cards(d)) > 0)
+    cards = _get_visible_flight_cards(driver)
+    if not cards:
+        return False
+
+    first_card = cards[0]
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+            first_card,
+        )
+        driver.execute_script("arguments[0].style.border = '3px solid red';", first_card)
+    except Exception:
+        pass
+
+    if not _retry_click_card(driver, first_card, retries=3, delay=0.6):
+        return False
+
+    print("Cheapest flight selected from sorted list.")
+    return True
+
+
+def _safe_find_elements(driver, by, value):
+    """find_elements with transient-driver retry; returns [] on persistent failure."""
+    try:
+        return _call_driver_with_retry(lambda: driver.find_elements(by, value)) or []
+    except Exception:
+        return []
+
+
+def _wait_for_xpath_presence(driver, xpath: str, timeout: int = 20) -> bool:
+    """Wait until at least one element exists for the given XPath."""
+    wait = WebDriverWait(driver, timeout)
+    try:
+        wait.until(lambda d: len(_safe_find_elements(d, By.XPATH, xpath)) > 0)
+        return True
+    except Exception:
+        return False
+
+
+def _click_first_visible(driver, xpaths: list, timeout: int = 20, retries: int = 3):
+    """Find and click the first visible element from a list of XPath locators."""
+    last_exc = None
+
+    for _ in range(retries):
+        for xp in xpaths:
+            try:
+                _wait_for_xpath_presence(driver, xp, timeout=timeout)
+                elems = _safe_find_elements(driver, By.XPATH, xp)
+                visible = [e for e in elems if e.is_displayed() and e.get_attribute("aria-disabled") != "true"]
+                if not visible:
+                    continue
+                el = visible[0]
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+                    el,
+                )
+                safe_click(driver, el)
+                return el
+            except Exception as exc:
+                last_exc = exc
+                continue
+        time.sleep(0.5)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No clickable element found for provided locators")
+
+
+def _expand_first_card_and_select_flight(driver, section_hint=None, timeout: int = 25) -> bool:
+    """Expand first flight card and click its 'Select flight' button."""
+    if section_hint:
+        _wait_for_xpath_presence(
+            driver,
+            f"//*[contains(normalize-space(.), '{section_hint}') and not(self::script)]",
+            timeout=timeout,
+        )
+
+    wait_for_results_container(driver, timeout=timeout)
+    cards = _get_visible_flight_cards(driver)
+    if not cards:
+        return False
+
+    first_card = cards[0]
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+            first_card,
+        )
+    except Exception:
+        pass
+
+    # Try expanding with a dropdown/details button inside first card.
+    expanded = False
+    expand_locators = [
+        ".//button[contains(@aria-label,'details') or contains(@aria-label,'Details') or contains(@aria-label,'expand') or contains(@aria-label,'Expand')]",
+        ".//*[@role='button' and (contains(@aria-label,'details') or contains(@aria-label,'expand'))]",
+    ]
+    for loc in expand_locators:
+        try:
+            btns = _call_driver_with_retry(lambda: first_card.find_elements(By.XPATH, loc))
+            btns = [b for b in btns if b.is_displayed() and b.get_attribute("aria-disabled") != "true"]
+            if btns:
+                _retry_click_card(driver, btns[0], retries=3, delay=0.5)
+                expanded = True
+                break
+        except Exception:
+            continue
+
+    # If no explicit expand button was found, clicking the card itself often expands.
+    if not expanded:
+        _retry_click_card(driver, first_card, retries=2, delay=0.4)
+
+    # Click first visible "Select flight".
+    try:
+        _click_first_visible(
+            driver,
+            [
+                "//button[.//span[contains(normalize-space(.), 'Select flight')] or contains(normalize-space(.), 'Select flight')]",
+                "//*[@role='button' and contains(normalize-space(.), 'Select flight')]",
+            ],
+            timeout=timeout,
+            retries=4,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _select_first_booking_provider(driver, timeout: int = 25) -> str:
+    """Select first booking provider and click Continue. Returns provider name."""
+    wait = WebDriverWait(driver, timeout)
+
+    # STEP 1 — Wait for booking options section visibility.
+    booking_heading_xpath = "//*[contains(normalize-space(.), 'Booking options')]"
+    book_with_xpath = "//*[contains(normalize-space(.), 'Book with')]"
+
+    try:
+        wait.until(
+            lambda d: any(e.is_displayed() for e in _safe_find_elements(d, By.XPATH, booking_heading_xpath))
+            or any(e.is_displayed() for e in _safe_find_elements(d, By.XPATH, book_with_xpath))
+        )
+    except Exception:
+        pass
+
+    # STEP 2 — Locate booking option cards and collect their Continue buttons.
+    provider_cards = _safe_find_elements(
+        driver,
+        By.XPATH,
+        "//*[contains(normalize-space(.), 'Book with') and not(self::script)]"
+    )
+    provider_cards = [c for c in provider_cards if c.is_displayed()]
+
+    continue_buttons = []
+    provider_name = ""
+
+    for idx, card in enumerate(provider_cards):
+        try:
+            btns = _call_driver_with_retry(
+                lambda: card.find_elements(
+                    By.XPATH,
+                    ".//button[contains(normalize-space(.), 'Continue')] | .//*[@role='button' and contains(normalize-space(.), 'Continue')]"
+                )
+            )
+            btns = [b for b in btns if b.is_displayed() and b.get_attribute("aria-disabled") != "true"]
+            if btns:
+                continue_buttons.append(btns[0])
+                if idx == 0:
+                    txt = card.text.strip()
+                    provider_name = txt.replace("Book with", "").strip() if "Book with" in txt else txt
+        except Exception:
+            continue
+
+    # Fallback: if cards did not yield buttons, collect visible Continue globally.
+    if not continue_buttons:
+        for xp in [
+            "//button[contains(normalize-space(.), 'Continue')]",
+            "//*[@role='button' and contains(normalize-space(.), 'Continue')]",
+        ]:
+            btns = _safe_find_elements(driver, By.XPATH, xp)
+            btns = [b for b in btns if b.is_displayed() and b.get_attribute("aria-disabled") != "true"]
+            if btns:
+                continue_buttons.extend(btns)
+                break
+
+    if not continue_buttons:
+        raise RuntimeError("No Continue button found in booking options section")
+
+    # STEP 3/4 — Select first option and click with retry + safe click logic.
+    first_continue = continue_buttons[0]
+    print("Selecting first booking option.")
+
+    clicked = False
+    for _ in range(3):
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+                first_continue,
+            )
+            safe_click(driver, first_continue)
+            clicked = True
+            break
+        except Exception:
+            time.sleep(0.4)
+
+    if not clicked:
+        raise RuntimeError("Could not click Continue on first booking provider")
+
+    print("Clicked Continue.")
+
+    # STEP 5 — Wait for contact info page.
+    wait.until(
+        lambda d: any(e.is_displayed() for e in _safe_find_elements(
+            d,
+            By.XPATH,
+            "//*[contains(normalize-space(.), 'Enter Contact Information') or contains(normalize-space(.), 'Contact Information')]"
+        ))
+    )
+    print("Contact information page loaded.")
+
+    return provider_name or "first available provider"
+
+
+def _is_booking_page_visible(driver) -> bool:
+    """Return True when Selected flights/Booking options page is visible."""
+    checks = [
+        "//*[contains(normalize-space(.), 'Selected flights')]",
+        "//*[contains(normalize-space(.), 'Booking options')]",
+    ]
+    for xp in checks:
+        elems = _safe_find_elements(driver, By.XPATH, xp)
+        if any(e.is_displayed() for e in elems):
+            return True
+    return False
+
+
+def _wait_for_booking_page(driver, timeout: int = 25) -> bool:
+    """Wait until booking page markers are visible."""
+    wait = WebDriverWait(driver, timeout)
+    try:
+        wait.until(lambda d: _is_booking_page_visible(d))
+        return True
+    except Exception:
+        return False
+
+
+def _fill_contact_information(driver, phone: str, email: str, timeout: int = 30) -> bool:
+    """Fill Mobile Number and Email ID fields on booking page."""
+    def fill_field(label_variants, value):
+        if not value:
+            return True
+
+        xps = []
+        for label in label_variants:
+            xps.extend([
+                f"//input[contains(@aria-label, '{label}') or contains(@placeholder, '{label}') or contains(@name, '{label}')]",
+                f"//label[contains(normalize-space(.), '{label}')]/following::input[1]",
+                f"//*[contains(normalize-space(.), '{label}')]/following::input[1]",
+            ])
+
+        field = None
+        for xp in xps:
+            try:
+                _wait_for_xpath_presence(driver, xp, timeout=timeout)
+                elems = _safe_find_elements(driver, By.XPATH, xp)
+                elems = [e for e in elems if e.is_displayed()]
+                if elems:
+                    field = elems[0]
+                    break
+            except Exception:
+                continue
+
+        if field is None:
+            return False
+
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+                field,
+            )
+            safe_click(driver, field)
+            browser_keys(driver, Keys.CONTROL + "a")
+            browser_keys(driver, Keys.BACKSPACE)
+            browser_keys(driver, value)
+            return True
+        except Exception:
+            return False
+
+    ok_phone = fill_field(["Mobile Number", "Phone", "Mobile"], phone)
+    ok_email = fill_field(["Email ID", "Email"], email)
+    return ok_phone and ok_email
+
+
+def _complete_booking_steps(driver, info: FlightInfo) -> None:
+    """Complete post-selection booking steps up to payment screen."""
+    current_stage = "departure_selection"
+
+    # Stage 1 → Departure flight selection
+    if current_stage == "departure_selection":
+        if _is_booking_page_visible(driver):
+            current_stage = "booking"
+        else:
+            dep_ok = _expand_first_card_and_select_flight(driver, section_hint="Top departing flights", timeout=30)
+            if dep_ok:
+                print("Departure flight selected.")
+                current_stage = "return_selection"
+            else:
+                print("   ⚠ Could not select departure flight automatically.")
+                return
+
+    # Stage 2 → Return flight selection
+    if current_stage == "return_selection":
+        # If the booking page is already visible, do not run return dropdown logic.
+        if _is_booking_page_visible(driver):
+            print("Booking page detected.")
+            current_stage = "booking"
+        else:
+            ret_ok = _expand_first_card_and_select_flight(driver, section_hint="Top returning flights", timeout=35)
+            if ret_ok:
+                print("Return flight selected.")
+                if _wait_for_booking_page(driver, timeout=35):
+                    print("Booking page detected.")
+                    current_stage = "booking"
+                else:
+                    print("   ⚠ Return selected but booking page was not detected.")
+                    return
+            else:
+                print("   ⚠ Could not select return flight automatically.")
+                return
+
+    # Stage 3 → Booking options page
+    if current_stage == "booking":
+        try:
+            provider = _select_first_booking_provider(driver, timeout=35)
+            print(f"Selected booking provider: {provider}.")
+            current_stage = "contact_information"
+        except Exception:
+            print("   ⚠ Could not select booking provider automatically.")
+            return
+
+    # Stage 4 → Contact information page
+    if current_stage == "contact_information":
+        if _fill_contact_information(driver, info.phone, info.email, timeout=35):
+            print("Contact information filled.")
+            current_stage = "proceed_to_payment"
+        else:
+            print("   ⚠ Could not fully fill contact information.")
+            return
+
+    # Stage 5 → Proceed to payment
+    if current_stage == "proceed_to_payment":
+        try:
+            _click_first_visible(
+                driver,
+                [
+                    "//button[contains(normalize-space(.), 'Proceed To Pay')]",
+                    "//*[@role='button' and contains(normalize-space(.), 'Proceed To Pay')]",
+                ],
+                timeout=30,
+                retries=4,
+            )
+            print("Proceeding to payment page.")
+        except Exception:
+            print("   ⚠ Could not click Proceed To Pay automatically.")
+            return
+
+    print("Automation completed successfully. Awaiting manual payment.")
+
+
 def _set_passengers(driver, num_passengers: int) -> None:
     """Adjust the passenger count."""
     if num_passengers <= 1:
@@ -639,8 +1095,6 @@ def automate_search(info: FlightInfo) -> webdriver.Chrome:
     """Open Google Flights, fill the search form, and click Search."""
     driver = launch_browser()
     flights = []
-    sorted_flights = []
-    cheapest_flight = None
 
     print("\n🌐 Opening Google Flights …")
     driver.get(config.GOOGLE_FLIGHTS_URL)
@@ -691,21 +1145,13 @@ def automate_search(info: FlightInfo) -> webdriver.Chrome:
                 flights = extract_flight_results(driver, max_results=15, timeout=30)
                 print(f"\nExtracted {len(flights)} flights")
 
-                print("\nSorting flights by price...")
-                sorted_flights, cheapest_flight = find_cheapest_flight(flights)
-
-                print("\nCheapest flight found:")
-                if cheapest_flight:
-                    print(f"Airline: {cheapest_flight.get('airline', '')}")
-                    print(f"Departure: {cheapest_flight.get('departure', '')}")
-                    print(f"Arrival: {cheapest_flight.get('arrival', '')}")
-                    print(f"Duration: {cheapest_flight.get('duration', '')}")
-                    print(f"Stops: {cheapest_flight.get('stops', '')}")
-                    print(f"Price: {cheapest_flight.get('price', '')}")
+                selected = _select_cheapest_from_sorted_list(driver, timeout=30)
+                if not selected:
+                    print("   ⚠ Could not auto-select flight from Cheapest sorted list.")
                 else:
-                    print("No valid priced flights were found.")
+                    _complete_booking_steps(driver, info)
 
-                for i, f in enumerate(sorted_flights[:5], start=1):
+                for i, f in enumerate(flights[:5], start=1):
                     print(
                         f"      {i}. {f.get('airline', '')} | "
                         f"{f.get('departure', '')} → {f.get('arrival', '')} | "
@@ -721,8 +1167,8 @@ def automate_search(info: FlightInfo) -> webdriver.Chrome:
 
     # Store extracted list on driver object for optional downstream usage.
     driver.extracted_flights = flights
-    driver.sorted_flights = sorted_flights
-    driver.cheapest_flight = cheapest_flight
+    driver.sorted_flights = []
+    driver.cheapest_flight = None
 
     print("\n✅ Done! The browser will stay open for you.\n")
     return driver
