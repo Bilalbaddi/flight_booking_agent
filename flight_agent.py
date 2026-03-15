@@ -901,16 +901,6 @@ def _select_first_booking_provider(driver, timeout: int = 25) -> str:
 
     print("Clicked Continue.")
 
-    # STEP 5 — Wait for contact info page.
-    wait.until(
-        lambda d: any(e.is_displayed() for e in _safe_find_elements(
-            d,
-            By.XPATH,
-            "//*[contains(normalize-space(.), 'Enter Contact Information') or contains(normalize-space(.), 'Contact Information')]"
-        ))
-    )
-    print("Contact information page loaded.")
-
     return provider_name or "first available provider"
 
 
@@ -937,41 +927,355 @@ def _wait_for_booking_page(driver, timeout: int = 25) -> bool:
         return False
 
 
-def _fill_contact_information(driver, phone: str, email: str, timeout: int = 30) -> bool:
-    """Fill Mobile Number and Email ID fields on booking page."""
-    def fill_field(label_variants, value):
-        if not value:
+def _is_payment_page_visible(driver) -> bool:
+    """
+    Detect payment page ONLY via explicit payment form fields.
+
+    Avoid broad fare/price text markers (they appear in non-payment steps too).
+    """
+    payment_field_xpaths = [
+        # Card number
+        "//input[contains(translate(@name,'CARD','card'),'card') or contains(translate(@id,'CARD','card'),'card') or contains(translate(@placeholder,'CARD','card'),'card')]",
+        # CVV
+        "//input[contains(translate(@name,'CVV','cvv'),'cvv') or contains(translate(@id,'CVV','cvv'),'cvv') or contains(translate(@placeholder,'CVV','cvv'),'cvv')]",
+        # UPI
+        "//input[contains(translate(@name,'UPI','upi'),'upi') or contains(translate(@id,'UPI','upi'),'upi') or contains(translate(@placeholder,'UPI','upi'),'upi')]",
+        # Expiry
+        "//input[contains(translate(@name,'EXPIRY','expiry'),'expiry') or contains(translate(@id,'EXPIRY','expiry'),'expiry') or contains(translate(@placeholder,'EXPIRY','expiry'),'expiry') or contains(translate(@placeholder,'EXP DATE','exp date'),'exp date')]",
+        # Credit / debit card specific input naming
+        "//input[contains(translate(@name,'CREDITDEBIT','creditdebit'),'credit') or contains(translate(@name,'CREDITDEBIT','creditdebit'),'debit') or contains(translate(@id,'CREDITDEBIT','creditdebit'),'credit') or contains(translate(@id,'CREDITDEBIT','creditdebit'),'debit')]",
+        # Payment method selectors
+        "//select[contains(translate(@name,'PAYMENTMETHOD','paymentmethod'),'payment') or contains(translate(@id,'PAYMENTMETHOD','paymentmethod'),'payment')]",
+        "//input[@type='radio' and (contains(translate(@name,'PAYMENTMETHOD','paymentmethod'),'payment') or contains(translate(@id,'PAYMENTMETHOD','paymentmethod'),'payment'))]",
+    ]
+
+    for xp in payment_field_xpaths:
+        elems = _safe_find_elements(driver, By.XPATH, xp)
+        if any(e.is_displayed() for e in elems):
             return True
 
-        xps = []
-        for label in label_variants:
-            xps.extend([
-                f"//input[contains(@aria-label, '{label}') or contains(@placeholder, '{label}') or contains(@name, '{label}')]",
-                f"//label[contains(normalize-space(.), '{label}')]/following::input[1]",
-                f"//*[contains(normalize-space(.), '{label}')]/following::input[1]",
-            ])
+    return False
 
-        field = None
-        for xp in xps:
+
+def _has_contact_fields(driver) -> bool:
+    """Detect common provider contact fields (email + phone)."""
+    email_fields = _safe_find_elements(
+        driver,
+        By.XPATH,
+        "//input[@type='email' or contains(translate(@placeholder,'EMAIL','email'),'email') or contains(translate(@aria-label,'EMAIL','email'),'email')]"
+    )
+    phone_fields = _safe_find_elements(
+        driver,
+        By.XPATH,
+        "//input[@type='tel' or contains(translate(@placeholder,'MOBILEPHONE','mobilephone'),'mobile') or contains(translate(@placeholder,'MOBILEPHONE','mobilephone'),'phone') or contains(translate(@aria-label,'MOBILEPHONE','mobilephone'),'mobile') or contains(translate(@aria-label,'MOBILEPHONE','mobilephone'),'phone')]"
+    )
+    return any(e.is_displayed() for e in email_fields) and any(e.is_displayed() for e in phone_fields)
+
+
+def _wait_for_provider_page(driver, timeout: int = 15) -> bool:
+    """Wait for any provider-page activity after redirect from Google Flights."""
+    wait = WebDriverWait(driver, timeout)
+    try:
+        wait.until(
+            lambda d: _is_payment_page_visible(d)
+            or _has_contact_fields(d)
+            or any(e.is_displayed() for e in _safe_find_elements(
+                d,
+                By.XPATH,
+                "//button[contains(normalize-space(.), 'Next') or contains(normalize-space(.), 'Continue') or contains(normalize-space(.), 'Proceed') or contains(normalize-space(.), 'Select') or contains(normalize-space(.), 'Book') or contains(normalize-space(.), 'Review')]"
+            ))
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _detect_provider_stage(driver) -> str:
+    """Detect provider booking wizard stage from visible page text and fields."""
+    if _is_payment_page_visible(driver):
+        return "payment"
+
+    try:
+        page_text = _call_driver_with_retry(
+            lambda: driver.execute_script("return (document.body && document.body.innerText) ? document.body.innerText : '';")
+        )
+    except Exception:
+        page_text = ""
+
+    text = (page_text or "").lower()
+
+    passenger_markers = [
+        "enter passenger details",
+        "first and middle name",
+        "last name",
+        "date of birth",
+        "passenger",
+    ]
+    if any(m in text for m in passenger_markers):
+        return "passenger"
+
+    return_markers = [
+        "del — bom",
+        "del - bom",
+        "return flight",
+        "return fare",
+        "return",
+    ]
+    if any(m in text for m in return_markers):
+        return "return_fare"
+
+    outbound_markers = [
+        "bom — del",
+        "bom - del",
+        "fare types",
+        "saver fare",
+        "economy",
+        "your selected flight",
+    ]
+    if any(m in text for m in outbound_markers):
+        return "outbound_fare"
+
+    review_markers = ["review", "add-ons", "addons", "seat", "extras", "total fare"]
+    if any(m in text for m in review_markers):
+        return "review"
+
+    return "unknown"
+
+
+def _capture_stage_debug(driver, prefix: str = "unknown_stage") -> None:
+    """Capture screenshot + visible headings for unknown stage diagnosis."""
+    ts = int(time.time())
+    shot = f"{prefix}_{ts}.png"
+    try:
+        _call_driver_with_retry(lambda: driver.save_screenshot(shot))
+        print(f"   Debug — saved screenshot: {shot}")
+    except Exception:
+        pass
+
+    headings = []
+    try:
+        elems = _safe_find_elements(driver, By.XPATH, "//h1 | //h2 | //h3 | //label | //legend")
+        for e in elems:
+            if not e.is_displayed():
+                continue
+            txt = (e.text or "").strip()
+            if txt and txt not in headings:
+                headings.append(txt)
+            if len(headings) >= 8:
+                break
+    except Exception:
+        pass
+
+    if headings:
+        print("   Debug — visible headings:")
+        for h in headings:
+            print(f"      → {h}")
+
+
+def _split_passenger_name(full_name: str):
+    parts = [p for p in (full_name or "").strip().split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def _fill_passenger_information_stage(driver, info: FlightInfo) -> bool:
+    """Fill passenger fields if present. Prompts user in terminal for missing values."""
+    first_name, last_name = _split_passenger_name(info.passenger_name)
+    gender = ""
+    dob = ""
+
+    if not first_name:
+        first_name = input("Please provide passenger first name: ").strip()
+    if not last_name:
+        last_name = input("Please provide passenger last name: ").strip()
+
+    def fill_first_visible(xpaths, value):
+        if not value:
+            return False
+        for xp in xpaths:
+            elems = [e for e in _safe_find_elements(driver, By.XPATH, xp) if e.is_displayed()]
+            if not elems:
+                continue
+            field = elems[0]
             try:
-                _wait_for_xpath_presence(driver, xp, timeout=timeout)
-                elems = _safe_find_elements(driver, By.XPATH, xp)
-                elems = [e for e in elems if e.is_displayed()]
-                if elems:
-                    field = elems[0]
-                    break
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+                    field,
+                )
+                safe_click(driver, field)
+                browser_keys(driver, Keys.CONTROL + "a")
+                browser_keys(driver, Keys.BACKSPACE)
+                browser_keys(driver, value)
+                return True
             except Exception:
                 continue
+        return False
 
-        if field is None:
-            return False
+    ok_first = fill_first_visible([
+        "//input[contains(translate(@placeholder,'FIRSTMIDDLE','firstmiddle'),'first')]",
+        "//input[contains(translate(@aria-label,'FIRSTMIDDLE','firstmiddle'),'first')]",
+        "//input[contains(translate(@name,'FIRSTMIDDLE','firstmiddle'),'first')]",
+    ], first_name)
 
+    ok_last = fill_first_visible([
+        "//input[contains(translate(@placeholder,'LASTNAME','lastname'),'last')]",
+        "//input[contains(translate(@aria-label,'LASTNAME','lastname'),'last')]",
+        "//input[contains(translate(@name,'LASTNAME','lastname'),'last')]",
+    ], last_name)
+
+    # If gender widget exists, request gender and try to fill.
+    gender_widgets = _safe_find_elements(
+        driver,
+        By.XPATH,
+        "//select[contains(translate(@name,'GENDER','gender'),'gender')] | //*[@role='combobox' and contains(translate(@aria-label,'GENDER','gender'),'gender')]"
+    )
+    gender_widgets = [g for g in gender_widgets if g.is_displayed()]
+    if gender_widgets:
+        gender = input("Please provide passenger gender (Male/Female/Other): ").strip()
+        fill_first_visible([
+            "//select[contains(translate(@name,'GENDER','gender'),'gender')]",
+            "//*[@role='combobox' and contains(translate(@aria-label,'GENDER','gender'),'gender')]",
+        ], gender)
+
+    dob_fields = _safe_find_elements(
+        driver,
+        By.XPATH,
+        "//input[contains(translate(@placeholder,'DATEOFBIRTHDOB','dateofbirthdob'),'date') or contains(translate(@name,'DATEOFBIRTHDOB','dateofbirthdob'),'dob')]"
+    )
+    dob_fields = [d for d in dob_fields if d.is_displayed()]
+    if dob_fields:
+        dob = input("Please provide passenger date of birth (DD/MM/YYYY): ").strip()
+        fill_first_visible([
+            "//input[contains(translate(@placeholder,'DATEOFBIRTHDOB','dateofbirthdob'),'date') or contains(translate(@name,'DATEOFBIRTHDOB','dateofbirthdob'),'dob')]"
+        ], dob)
+
+    return ok_first or ok_last or bool(gender_widgets) or bool(dob_fields)
+
+
+def _run_provider_wizard(driver, info: FlightInfo, max_steps: int = 10) -> bool:
+    """Deterministic provider navigation: outbound -> return -> passenger -> review -> payment."""
+    current_stage = "outbound_fare"
+
+    for _ in range(max_steps):
+        if _is_payment_page_visible(driver):
+            print("Payment page reached. Automation stopped for manual payment.")
+            return True
+
+        detected = _detect_provider_stage(driver)
+
+        if current_stage == "outbound_fare":
+            if detected in ["return_fare", "passenger", "review"]:
+                current_stage = "return_fare"
+                continue
+
+            if detected in ["outbound_fare", "unknown"]:
+                moved = _click_provider_navigation_button(
+                    driver,
+                    timeout=6,
+                    scan_interval=2,
+                    keywords=["next"],
+                    log_message="Outbound fare page detected. Clicking Next."
+                )
+                if moved:
+                    current_stage = "return_fare"
+                    time.sleep(2)
+                    continue
+
+        if current_stage == "return_fare":
+            if detected in ["passenger", "review"]:
+                current_stage = "passenger"
+                continue
+
+            if detected in ["return_fare", "unknown", "outbound_fare"]:
+                moved = _click_provider_navigation_button(
+                    driver,
+                    timeout=6,
+                    scan_interval=2,
+                    keywords=["next"],
+                    log_message="Return fare page detected. Clicking Next."
+                )
+                if moved:
+                    current_stage = "passenger"
+                    time.sleep(2)
+                    continue
+
+        if current_stage == "passenger":
+            if detected == "payment":
+                print("Payment page reached. Automation stopped for manual payment.")
+                return True
+
+            filled = _fill_passenger_information_stage(driver, info)
+            if filled:
+                moved = _click_provider_navigation_button(
+                    driver,
+                    timeout=8,
+                    scan_interval=2,
+                    keywords=["continue", "next", "proceed", "review"],
+                    log_message="Passenger information completed. Continuing booking."
+                )
+                if moved:
+                    current_stage = "review"
+                    time.sleep(2)
+                    continue
+
+        if current_stage == "review":
+            moved = _click_provider_navigation_button(
+                driver,
+                timeout=8,
+                scan_interval=2,
+                keywords=["continue", "next", "proceed", "review", "book"],
+                log_message="Proceeding to next booking step."
+            )
+            if moved:
+                time.sleep(2)
+                continue
+
+        # Unknown or no progress: capture debug, try primary nav, and re-evaluate.
+        _capture_stage_debug(driver, prefix="provider_stage")
+        fallback_moved = _click_provider_navigation_button(
+            driver,
+            timeout=6,
+            scan_interval=2,
+            keywords=["next", "continue", "proceed"],
+            log_message="Intermediate booking step detected. Clicking Next."
+        )
+        if not fallback_moved:
+            break
+        time.sleep(2)
+
+    return _is_payment_page_visible(driver)
+
+
+def _fill_contact_information(driver, phone: str, email: str, timeout: int = 15, scan_interval: int = 2) -> bool:
+    """Goal-based contact fill that works across multiple booking providers."""
+    end_time = time.time() + timeout
+
+    email_xpath = (
+        "//input[@type='email' or "
+        "contains(translate(@placeholder,'EMAIL','email'),'email') or "
+        "contains(translate(@aria-label,'EMAIL','email'),'email') or "
+        "contains(translate(@name,'EMAIL','email'),'email')]"
+    )
+    phone_xpath = (
+        "//input[@type='tel' or "
+        "contains(translate(@placeholder,'MOBILEPHONE','mobilephone'),'mobile') or "
+        "contains(translate(@placeholder,'MOBILEPHONE','mobilephone'),'phone') or "
+        "contains(translate(@aria-label,'MOBILEPHONE','mobilephone'),'mobile') or "
+        "contains(translate(@aria-label,'MOBILEPHONE','mobilephone'),'phone') or "
+        "contains(translate(@name,'MOBILEPHONE','mobilephone'),'mobile') or "
+        "contains(translate(@name,'MOBILEPHONE','mobilephone'),'phone')]"
+    )
+
+    def fill_input(el, value):
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
-                field,
+                el,
             )
-            safe_click(driver, field)
+            safe_click(driver, el)
             browser_keys(driver, Keys.CONTROL + "a")
             browser_keys(driver, Keys.BACKSPACE)
             browser_keys(driver, value)
@@ -979,9 +1283,114 @@ def _fill_contact_information(driver, phone: str, email: str, timeout: int = 30)
         except Exception:
             return False
 
-    ok_phone = fill_field(["Mobile Number", "Phone", "Mobile"], phone)
-    ok_email = fill_field(["Email ID", "Email"], email)
-    return ok_phone and ok_email
+    while time.time() < end_time:
+        if _is_payment_page_visible(driver):
+            return True
+
+        email_ok = not bool(email)
+        phone_ok = not bool(phone)
+
+        if email and not email_ok:
+            email_fields = [e for e in _safe_find_elements(driver, By.XPATH, email_xpath) if e.is_displayed()]
+            if email_fields:
+                email_ok = fill_input(email_fields[0], email)
+
+        if phone and not phone_ok:
+            phone_fields = [e for e in _safe_find_elements(driver, By.XPATH, phone_xpath) if e.is_displayed()]
+            if phone_fields:
+                phone_ok = fill_input(phone_fields[0], phone)
+
+        if email_ok and phone_ok:
+            print("Contact information form detected and filled.")
+            return True
+
+        time.sleep(scan_interval)
+
+    return False
+
+
+def _click_provider_navigation_button(driver, timeout: int = 15, scan_interval: int = 2, keywords=None, log_message="Proceeding to next booking step.") -> bool:
+    """Find and click the first visible Continue/Proceed/Next/Book/Pay style button."""
+    end_time = time.time() + timeout
+    keywords = keywords or ["continue", "proceed", "next", "book", "pay"]
+    text_match = " or ".join([
+        f"contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{k.lower()}')"
+        for k in keywords
+    ])
+    nav_xpath = f"//button[({text_match})] | //*[@role='button' and ({text_match})]"
+
+    while time.time() < end_time:
+        if _is_payment_page_visible(driver):
+            return True
+
+        # Sticky footer first: provider UIs (e.g. IndiGo) often render Next
+        # in a fixed bottom bar where normal click/scroll logic can fail.
+        sticky_footer_xpath = (
+            "//*[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'footer') "
+            "or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sticky') "
+            "or contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'bottom')]"
+        )
+        sticky_containers = [
+            c for c in _safe_find_elements(driver, By.XPATH, sticky_footer_xpath)
+            if c.is_displayed()
+        ]
+        if sticky_containers:
+            sticky_deadline = min(end_time, time.time() + 10)
+            while time.time() < sticky_deadline:
+                for container in sticky_containers:
+                    try:
+                        next_btns = _call_driver_with_retry(
+                            lambda: container.find_elements(
+                                By.XPATH,
+                                ".//button[.//span[normalize-space()='Next'] or contains(normalize-space(.), 'Next')] "
+                                "| .//*[@role='button' and (.//span[normalize-space()='Next'] or contains(normalize-space(.), 'Next'))]"
+                            )
+                        )
+                    except Exception:
+                        next_btns = []
+
+                    next_btns = [
+                        b for b in next_btns
+                        if b.is_displayed() and b.get_attribute("aria-disabled") != "true"
+                    ]
+                    if not next_btns:
+                        continue
+
+                    btn = next_btns[0]
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({behavior:'instant', block:'center', inline:'nearest'});",
+                            btn,
+                        )
+                        driver.execute_script("arguments[0].click();", btn)
+                        print("Detected sticky footer Next button. Clicking.")
+                        return True
+                    except Exception:
+                        continue
+                time.sleep(0.4)
+
+        buttons = [
+            b for b in _safe_find_elements(driver, By.XPATH, nav_xpath)
+            if b.is_displayed() and b.get_attribute("aria-disabled") != "true"
+        ]
+
+        if buttons:
+            btn = buttons[0]
+            for _ in range(3):
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});",
+                        btn,
+                    )
+                    safe_click(driver, btn)
+                    print(log_message)
+                    return True
+                except Exception:
+                    time.sleep(0.4)
+
+        time.sleep(scan_interval)
+
+    return False
 
 
 def _complete_booking_steps(driver, info: FlightInfo) -> None:
@@ -1026,6 +1435,10 @@ def _complete_booking_steps(driver, info: FlightInfo) -> None:
         try:
             provider = _select_first_booking_provider(driver, timeout=35)
             print(f"Selected booking provider: {provider}.")
+            if _wait_for_provider_page(driver, timeout=15):
+                print("Booking provider page detected.")
+            else:
+                print("   ⚠ Provider page load signal was weak; continuing with scans.")
             current_stage = "contact_information"
         except Exception:
             print("   ⚠ Could not select booking provider automatically.")
@@ -1033,31 +1446,19 @@ def _complete_booking_steps(driver, info: FlightInfo) -> None:
 
     # Stage 4 → Contact information page
     if current_stage == "contact_information":
-        if _fill_contact_information(driver, info.phone, info.email, timeout=35):
-            print("Contact information filled.")
-            current_stage = "proceed_to_payment"
-        else:
-            print("   ⚠ Could not fully fill contact information.")
+        wizard_done = _run_provider_wizard(driver, info, max_steps=12)
+        if not wizard_done:
+            print("   ⚠ Provider wizard could not deterministically reach payment stage.")
             return
+        current_stage = "proceed_to_payment"
 
-    # Stage 5 → Proceed to payment
+    # Stage 5 → Navigate to payment and stop there
     if current_stage == "proceed_to_payment":
-        try:
-            _click_first_visible(
-                driver,
-                [
-                    "//button[contains(normalize-space(.), 'Proceed To Pay')]",
-                    "//*[@role='button' and contains(normalize-space(.), 'Proceed To Pay')]",
-                ],
-                timeout=30,
-                retries=4,
-            )
-            print("Proceeding to payment page.")
-        except Exception:
-            print("   ⚠ Could not click Proceed To Pay automatically.")
+        if _is_payment_page_visible(driver):
+            print("Payment page reached. Automation stopped for manual payment.")
             return
 
-    print("Automation completed successfully. Awaiting manual payment.")
+        print("   ⚠ Payment page was not visible after deterministic wizard run.")
 
 
 def _set_passengers(driver, num_passengers: int) -> None:
